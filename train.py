@@ -17,6 +17,7 @@ from model import (
     TinySeq2Seq,
     CharTokenizer,      # 문자 단위 토크나이저
     tokenize_batch,     # batch(dict)를 토크나이즈 + 패딩까지 해주는 함수
+    digits_to_string,
     INPUT_CHARS,        # 입력 문자 집합
     OUTPUT_CHARS,       # 출력 문자 집합
 )
@@ -43,9 +44,8 @@ def train_loop(
     # 옵티마이저: AdamW는 Adam + weight decay가 들어간 버전
     optim = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
 
-    # seq2seq에서 흔히 쓰는 CE loss
-    # pad 토큰은 무시하도록(ignore_index) 설정
-    loss_fn = nn.CrossEntropyLoss(ignore_index=output_tokenizer.pad_id)
+    # 각 자리수에 대한 CrossEntropy loss
+    loss_fn = nn.CrossEntropyLoss()
 
     step = 0
     model.train()  # 학습 모드로 전환 (Dropout 등 켜짐)
@@ -65,35 +65,28 @@ def train_loop(
         for batch in dataloader:
             # --------------------------------------------------------------
             # 1) 토크나이즈 & 텐서로 변환
-            #    `tokenize_batch`는 BatchTensors(src, tgt_inp, tgt_out)를 반환합니다.
-            #    변수 역할:
-            #      - `src` (encoder input): 모델의 인코더 입력. 정수 텐서, shape (B, S).
-            #      - `target_input` (tgt_inp): 디코더에 teacher-forcing으로 넣는 입력. shape (B, T).
-            #          일반적으로 BOS를 앞에 붙이고 EOS는 제외한 시퀀스입니다.
-            #      - `target_output` (tgt_out): 디코더가 예측해야 하는 정답(손실 대상). shape (B, T).
-            #          일반적으로 target_input에서 BOS를 뺀 것에 EOS를 붙인 형태입니다.
-            #    예시 (토큰 id가 다음과 같다고 가정):
-            #      bos_id=1, eos_id=2, '1'->5, '6'->6
-            #      원본 target_text: "16"
-            #      target_input ids:  [1, 5, 6]    # [BOS, '1', '6']
-            #      target_output ids: [5, 6, 2]    # ['1', '6', EOS']
-            #    주의: 모든 텐서는 dtype=torch.long이고 `.to(device)`로 명시적 이동이 필요합니다.
+            #    입력은 후위표기 토큰 ID, 출력은 고정 길이 숫자 시퀀스입니다.
             # --------------------------------------------------------------
-            batch_tensors = tokenize_batch(batch, input_tokenizer, output_tokenizer)
+            batch_tensors = tokenize_batch(
+                batch,
+                input_tokenizer,
+                output_tokenizer,
+                max_input_length=tokenizer_config.max_input_length,
+                max_output_length=tokenizer_config.max_output_length,
+            )
             src = batch_tensors.src.to(device)
-            target_input = batch_tensors.tgt_inp.to(device)
-            target_output = batch_tensors.tgt_out.to(device)
+            target_digits = batch_tensors.tgt.to(device)
+            src_pad_mask = src.eq(input_tokenizer.pad_id)
 
-            # Forward: 모델에 입력을 전달하고 출력을 얻습니다.
-            # 출력은 (B, T, V) 형태로 반환됩니다.
-            logits = model(src, target_input, input_tokenizer.pad_id)
+            # Forward: Transformer Encoder 결과로 자리별 logits 생성
+            logits = model(src, src_pad_mask)
 
             # --------------------------------------------------------------
             # 4) Loss 계산
             # --------------------------------------------------------------
             loss = loss_fn(
                 logits.view(-1, logits.size(-1)),  # (B*T, V)
-                target_output.view(-1),             # (B*T,)
+                target_digits.view(-1),             # (B*T,)
             )
 
             # --------------------------------------------------------------
@@ -118,30 +111,19 @@ def train_loop(
                     inputs_all: List[str] = [] # 검증 데이터셋의 입력, 정답, 예측 결과를 저장할 리스트
 
                     for val_batch in val_dataloader: # 검증 데이터셋을 순회하며 각 배치에 대해 검증을 수행합니다.
-                        val_bt = tokenize_batch(val_batch, input_tokenizer, output_tokenizer)
-                        val_src = val_bt.src.to(device)
-                        gen_ids = model.generate(
-                            src=val_src,
-                            max_len=train_config.max_gen_len,
-                            bos_id=output_tokenizer.bos_id,
-                            eos_id=output_tokenizer.eos_id,
-                            src_pad_id=input_tokenizer.pad_id,
+                        val_bt = tokenize_batch(
+                            val_batch,
+                            input_tokenizer,
+                            output_tokenizer,
+                            max_input_length=tokenizer_config.max_input_length,
+                            max_output_length=tokenizer_config.max_output_length,
                         )
-
-                        for i in range(gen_ids.size(0)):
-                            seq_chars: List[str] = []
-                            for t in gen_ids[i].tolist():
-                                idx = int(t)
-                                if idx == output_tokenizer.eos_id:
-                                    break
-                                if idx in output_tokenizer.itos:
-                                    ch = output_tokenizer.itos[idx]
-                                    if ch.isdigit() or (ch == '-' and not seq_chars):
-                                        seq_chars.append(ch)
-                            pred_str = "".join(seq_chars)
-                            if pred_str == "-":
-                                pred_str = ""
-                            preds_all.append(pred_str)
+                        val_src = val_bt.src.to(device)
+                        val_mask = val_src.eq(input_tokenizer.pad_id)
+                        logits = model(val_src, val_mask)
+                        pred_digits = torch.argmax(logits, dim=-1).cpu().tolist()
+                        for seq in pred_digits:
+                            preds_all.append(digits_to_string(seq))
                         # 검증 데이터셋의 정답, 입력을 리스트에 추가합니다.
                         targets_all.extend(val_batch["target_text"])
                         inputs_all.extend(val_batch["input_text"])
@@ -245,6 +227,8 @@ def main():
         input_chars=INPUT_CHARS,
         output_chars=OUTPUT_CHARS,
         add_special=True,
+        max_input_length=64,
+        max_output_length=8,
     )
 
     # --------------------------------------------------------------------------
@@ -259,12 +243,6 @@ def main():
         tokenizer_config.output_chars if tokenizer_config.output_chars is not None else OUTPUT_CHARS,
         add_special=tokenizer_config.add_special,
     )
-
-    # --------------------------------------------------------------------------
-    # 4) 모델 설정 준비
-    # --------------------------------------------------------------------------
-    # 모델 아키텍처 설정 (별도로 관리)
-    model_config = ModelConfig(d_model=256)
 
     # --------------------------------------------------------------------------
     # 5) 학습 설정 준비
@@ -283,13 +261,34 @@ def main():
     # --------------------------------------------------------------------------
     # 6) 모델 준비
     # --------------------------------------------------------------------------
-    # GRU 기반의 TinySeq2Seq 모델을 준비합니다. 자세한 설정은 model.py를 참고하세요.
+    # Transformer 기반의 TinySeq2Seq 모델을 준비합니다.
+    model_config = ModelConfig(
+        d_model=256,
+        num_heads=8,
+        num_layers=4,
+        dim_feedforward=512,
+        dropout=0.1,
+        max_rel_distance=64,
+        output_length=tokenizer_config.max_output_length,
+    )
+
     # ModelConfig의 모든 필드를 **kwargs로 전달
+        # 숫자 토큰 id 리스트 생성 (0~9)
+    digit_token_ids: List[int] = []
+    for ch in "0123456789":
+        if ch in input_tokenizer.stoi:
+            digit_token_ids.append(input_tokenizer.stoi[ch])
+
     model = TinySeq2Seq(
         in_vocab=input_tokenizer.vocab_size,
         out_vocab=output_tokenizer.vocab_size,
-        **model_config.__dict__,  # 모델 설정을 **kwargs로 전달
+        # FPE(Abacus)용 추가 인자
+        max_input_length=tokenizer_config.max_input_length,  # seq_pos, max_seq_len 정렬
+        max_digit_pos=tokenizer_config.max_input_length,     # 자리수 최대 길이 (여유 있게)
+        digit_token_ids=digit_token_ids,                     # 어떤 토큰이 숫자인지
+        **model_config.__dict__,  # 나머지는 그대로
     )
+
 
     # --------------------------------------------------------------------------
     # 6) 학습 시작
