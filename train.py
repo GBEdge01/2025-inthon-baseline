@@ -188,8 +188,8 @@ def main():
     # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
     train_dataset = ArithmeticDataset(
         num_samples=500_000,
-        max_depth=3,
-        num_digits=(1, 3),
+        max_depth=5,
+        num_digits=(1, 5),
         seed=123,
         mode="train",
     )
@@ -205,7 +205,7 @@ def main():
     # Validation Dataset, 자세한 설정은 dataloader.py를 참고하세요.
     val_dataset = ArithmeticDataset(
         num_samples=128,
-        max_depth=4,
+        max_depth=5,
         num_digits=(1, 5),
         seed=999,
         mode="val",
@@ -253,7 +253,7 @@ def main():
         lr=2e-3,
         valid_every=200,
         max_gen_len=24,
-        show_valid_samples=5,
+        show_valid_samples=50,
         num_epochs=50,
         save_best_path="best_model.pt",
     )
