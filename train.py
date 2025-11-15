@@ -228,7 +228,7 @@ def main():
         output_chars=OUTPUT_CHARS,
         add_special=True,
         max_input_length=64,
-        max_output_length=8,
+        max_output_length=128,
     )
 
     # --------------------------------------------------------------------------
